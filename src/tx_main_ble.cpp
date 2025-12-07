@@ -992,9 +992,14 @@ void handleButtons() {
         return;
     }
     
-    // Joystick navigation thresholds
-    const int16_t NAV_THRESHOLD = 1000;  // ADC threshold for navigation (out of 32767) - increased for better sensitivity
-    const unsigned long NAV_DEBOUNCE = 200;  // ms between navigation events
+    // Joystick navigation - delta-based (requires 10% change from last position to trigger)
+    // This prevents continuous scrolling when stick is held deflected
+    const int16_t NAV_CENTER_DEADZONE = 2000;  // Must be outside this deadzone from center
+    const int16_t NAV_DELTA_THRESHOLD = 3277;  // 10% of 32767 = ~3277 to trigger navigation
+    const unsigned long NAV_DEBOUNCE = 100;    // ms between navigation events
+    
+    static int16_t last_nav_value = 0;  // Track last position that triggered navigation
+    static unsigned long last_nav = 0;
     
     // Get joystick values for navigation (use stick2_x for up/down, fallback to stick1_y)
     // Use already-read raw_adc values instead of reading ADC again
@@ -1006,25 +1011,36 @@ void handleButtons() {
         int16_t stick2_x_centered = raw_adc[2] - 16384;
         
         // Prefer stick2_x (v2_x) for navigation, but use stick1_y if stick2_x is not deflected enough
-        if (abs(stick2_x_centered) > NAV_THRESHOLD) {
+        if (abs(stick2_x_centered) > NAV_CENTER_DEADZONE) {
             nav_y = stick2_x_centered;
-        } else if (abs(stick1_y_centered) > NAV_THRESHOLD) {
+        } else if (abs(stick1_y_centered) > NAV_CENTER_DEADZONE) {
             nav_y = stick1_y_centered;
         }
     }
     
-    // Handle menu navigation with joystick
-    static unsigned long last_nav = 0;
-    if (abs(nav_y) > NAV_THRESHOLD && (millis() - last_nav > NAV_DEBOUNCE)) {
+    // Reset tracking when stick returns to center deadzone
+    if (abs(nav_y) <= NAV_CENTER_DEADZONE) {
+        last_nav_value = 0;
+    }
+    
+    // Handle menu navigation with joystick - delta-based
+    // Only navigate if the position changed by >10% from the last trigger point
+    int16_t delta = nav_y - last_nav_value;
+    
+    if (abs(nav_y) > NAV_CENTER_DEADZONE && 
+        abs(delta) > NAV_DELTA_THRESHOLD && 
+        (millis() - last_nav > NAV_DEBOUNCE)) {
+        
         if (menu_state == MENU_SELECT_DEVICE && discovered_count > 0) {
-            if (nav_y > 0) {
-                // Down (or Right for stick2_x)
+            if (delta > 0) {
+                // Moving positive direction (down/right)
                 selected_device = (selected_device + 1) % discovered_count;
             } else {
-                // Up (or Left for stick2_x)
+                // Moving negative direction (up/left)
                 selected_device = (selected_device - 1 + discovered_count) % discovered_count;
             }
             last_nav = millis();
+            last_nav_value = nav_y;  // Remember this position as the new reference
         }
     }
     
