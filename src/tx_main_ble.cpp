@@ -226,7 +226,8 @@ bool raw_buttons[2] = {false, false}; // Raw button states (ENTER, BACK)
 
 // Timing
 unsigned long lastDataSent = 0;
-const unsigned long DATA_INTERVAL = 20;  // 50Hz
+const unsigned long DATA_INTERVAL = 100;  // 20Hz target for lower latency
+const uint16_t DESIRED_ATT_MTU = 64;     // Enough for 22B frame + headers
 unsigned long lastDisplayUpdate = 0;
 const unsigned long DISPLAY_INTERVAL = 100;
 
@@ -536,7 +537,7 @@ static void send_channel_data(void) {
     
     // Debug occasionally
     static unsigned long lastDebug = 0;
-    if (millis() - lastDebug > 1000) {
+    if (millis() - lastDebug > 2000) {
         Serial.print("Sent seq ");
         Serial.print(sequenceNumber);
         Serial.print(" to handle 0x");
@@ -888,6 +889,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                         Serial.println(connection_handle, HEX);
                         strcpy(status_str, "Connected");
                         
+            // Request MTU negotiation to fit frames efficiently
+            gatt_client_send_mtu_negotiation(gatt_client_callback, connection_handle);
                         // Start service discovery
                         discover_services();
                     } else {
@@ -964,6 +967,24 @@ void readInputs() {
         raw_adc[3] = stick2_y;
     }
     
+    // Apply deadzone on ADC (5%) before mapping
+    auto applyDeadzone = [](int16_t val, uint16_t vmin, uint16_t vmax, float frac) -> int16_t {
+        if (vmax <= vmin + 10) return val;
+        float center = (vmin + vmax) * 0.5f;
+        float halfRange = (vmax - vmin) * 0.5f;
+        float dz = halfRange * frac;
+        float delta = val - center;
+        if (fabsf(delta) < dz) return (int16_t)center;
+        float sign = (delta > 0) ? 1.0f : -1.0f;
+        float adjusted = sign * ((fabsf(delta) - dz) / (halfRange - dz)) * halfRange;
+        return (int16_t)(center + adjusted);
+    };
+    const float DEADZONE = 0.05f; // 5%
+    stick1_x = applyDeadzone(stick1_x, calib.min[0], calib.max[0], DEADZONE);
+    stick1_y = applyDeadzone(stick1_y, calib.min[1], calib.max[1], DEADZONE);
+    stick2_x = applyDeadzone(stick2_x, calib.min[2], calib.max[2], DEADZONE);
+    // Leave throttle without deadzone to preserve full resolution
+
     // Map to channel values (1000-2000)
     // Calibrated based on actual ADC readings:
     // ADC range appears to be ~2917 (min) to ~23420 (max), center ~13199
@@ -981,6 +1002,25 @@ void readInputs() {
     channels[1] = mapCal(stick1_y, calib.min[1], calib.max[1]);  // Elevator
     channels[2] = mapCal(stick2_x, calib.min[2], calib.max[2]);  // Rudder
     channels[3] = mapCal(stick2_y, calib.min[3], calib.max[3]);  // Throttle
+
+    // Apply EdgeTX-style dual-rate/expo (Radiomaster Pocket defaults)
+    auto applyCurve = [](uint16_t us, float rate, float expo) -> uint16_t {
+        float x = (int(us) - 1500) / 500.0f;                  // -1..1
+        float x_expo = (1.0f - expo) * x + expo * x * x * x;  // soften center
+        float scaled = x_expo * rate;                         // cap max throw
+        int out = int(1500 + scaled * 500);
+        return (uint16_t)constrain(out, 1000, 2000);
+    };
+    // Typical EdgeTX wizard defaults: ~70% rate, 30% expo on sticks
+    // (throttle stays linear)
+    const float RATE = 0.7f;
+    const float EXPO = 0.3f;
+    channels[0] = applyCurve(channels[0], RATE, EXPO);
+    channels[1] = applyCurve(channels[1], RATE, EXPO);
+    channels[3] = applyCurve(channels[3], RATE, EXPO);
+    // Limit CH0/CH1 travel to 1300-1700 with center 1500
+    channels[0] = (uint16_t)constrain(channels[0], 1300, 1700);
+    channels[1] = (uint16_t)constrain(channels[1], 1300, 1700);
     
     if (menu_state == MENU_NORMAL_OPERATION) {
         
