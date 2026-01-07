@@ -73,10 +73,10 @@ bool SX128xLink::begin() {
     radio->setRfSwitchPins(SX128X_RXEN, SX128X_TXEN);
     Serial.println("[SX128x] RF switch pins set");
 
-    // DIO1 interrupt is only needed for async RX (startReceive/readData).
-    // On TX side we prefer to avoid DIO1 IRQ usage to keep transmit reliable.
-#if defined(RX_SIDE)
-    Serial.println("[SX128x] Setting DIO1 interrupt (RX_SIDE)...");
+    // DIO1 interrupt is needed for async RX (startReceive/readData).
+    // TX must also receive (pairing ACK, sync ACK, telemetry), so enable DIO1 on both sides.
+#if defined(RX_SIDE) || defined(TX_SIDE)
+    Serial.println("[SX128x] Setting DIO1 interrupt...");
     radio->setDio1Action(SX128xLink::dio1ISR);
     Serial.println("[SX128x] DIO1 interrupt set");
 #endif
@@ -119,9 +119,9 @@ bool SX128xLink::begin() {
     }
     Serial.println("[SX128x] beginFLRC successful");
 
-    // Continuous RX after init (RX side only).
-#if defined(RX_SIDE)
-    Serial.println("[SX128x] Starting receive (RX_SIDE)...");
+    // Continuous RX after init (both RX and TX need to receive).
+#if defined(RX_SIDE) || defined(TX_SIDE)
+    Serial.println("[SX128x] Starting receive...");
     startReceive();
     Serial.println("[SX128x] Receive started");
 #endif
@@ -162,9 +162,31 @@ bool SX128xLink::send(const uint8_t* data, size_t len) {
     }
     memcpy(buffer, data, len);
 
+    // Pad to a fixed packet length if configured (improves interoperability for FLRC fixed-length configs).
+    size_t txLen = len;
+#if defined(SX128X_FIXED_PACKET_LEN) && (SX128X_FIXED_PACKET_LEN > 0)
+    if (SX128X_FIXED_PACKET_LEN > sizeof(buffer)) {
+        Serial.print("[SX128x] ERROR: SX128X_FIXED_PACKET_LEN too large: ");
+        Serial.print(SX128X_FIXED_PACKET_LEN);
+        Serial.print(" > ");
+        Serial.println(sizeof(buffer));
+        return false;
+    }
+    if (len < (size_t)SX128X_FIXED_PACKET_LEN) {
+        memset(buffer + len, 0, (size_t)SX128X_FIXED_PACKET_LEN - len);
+        txLen = (size_t)SX128X_FIXED_PACKET_LEN;
+    }
+#endif
+
     Serial.print("[SX128x] Calling transmit() with len=");
-    Serial.println(len);
-    int16_t state = radio->transmit(buffer, len);
+    Serial.print(txLen);
+    if (txLen != len) {
+        Serial.print(" (padded from ");
+        Serial.print(len);
+        Serial.print(")");
+    }
+    Serial.println();
+    int16_t state = radio->transmit(buffer, txLen);
     
     if (state != RADIOLIB_ERR_NONE) {
         Serial.print("[SX128x] transmit() failed with code ");
@@ -177,8 +199,8 @@ bool SX128xLink::send(const uint8_t* data, size_t len) {
         Serial.println("[SX128x] transmit() successful");
     }
     
-    // Return to RX immediately after TX (RX side only). TX side stays in standby for max TX reliability.
-#if defined(RX_SIDE)
+    // Return to RX immediately after TX so we can receive ACK/telemetry.
+#if defined(RX_SIDE) || defined(TX_SIDE)
     startReceive();
 #endif
     return state == RADIOLIB_ERR_NONE;

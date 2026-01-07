@@ -9,6 +9,37 @@
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
 
+// Helper must run from RAM because we temporarily disable the XIP flash
+// interface by driving QSPI CS; executing from flash while CS is forced
+// low will hard fault/lock up.
+static bool __not_in_flash_func(readBootselButton)() {
+    const uint CS_PIN_INDEX = 1;
+
+    // Must disable interrupts, as interrupt handlers may be in flash
+    uint32_t flags = save_and_disable_interrupts();
+
+    // Set chip select to Hi-Z
+    hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                    GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+
+    // Brief delay for pin to settle
+    for (volatile int i = 0; i < 1000; ++i)
+        ;
+
+    // Read the pin state (low = pressed)
+    bool button_state = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
+
+    // Restore chip select to normal operation
+    hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
+                    GPIO_OVERRIDE_NORMAL << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
+                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
+
+    restore_interrupts(flags);
+
+    return button_state;
+}
+
 // ============================================================
 // TX Side: Send pairing key
 // ============================================================
@@ -107,33 +138,10 @@ void Pairing::exitPairingMode(bool* pairingMode, bool success) {
 }
 
 bool Pairing::getBootselButton() {
-    const uint CS_PIN_INDEX = 1;
-    
-    // Must disable interrupts, as interrupt handlers may be in flash
-    uint32_t flags = save_and_disable_interrupts();
-    
-    // Set chip select to Hi-Z
-    hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
-                    GPIO_OVERRIDE_LOW << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
-                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
-    
-    // Brief delay for pin to settle
-    for (volatile int i = 0; i < 1000; ++i);
-    
-    // Read the pin state (low = pressed)
-    bool button_state = !(sio_hw->gpio_hi_in & (1u << CS_PIN_INDEX));
-    
-    // Restore chip select to normal operation
-    hw_write_masked(&ioqspi_hw->io[CS_PIN_INDEX].ctrl,
-                    GPIO_OVERRIDE_NORMAL << IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_LSB,
-                    IO_QSPI_GPIO_QSPI_SS_CTRL_OEOVER_BITS);
-    
-    restore_interrupts(flags);
-    
-    return button_state;
+    return readBootselButton();
 }
 
-void Pairing::checkBootselButton(bool* pairingMode, unsigned long* pairingModeStartTime) {
+void Pairing::checkBootselButton(bool* pairingMode, unsigned long* pairingModeStartTime, bool isPaired) {
     if (!pairingMode || !pairingModeStartTime) return;
     
     static unsigned long lastCheck = 0;
@@ -148,13 +156,22 @@ void Pairing::checkBootselButton(bool* pairingMode, unsigned long* pairingModeSt
     if (buttonPressed && !buttonWasPressed) {
         buttonPressStart = millis();
         buttonWasPressed = true;
+        if (!isPaired) {
+            Serial.println("[PAIR] BOOTSEL pressed (waiting for hold to enter pairing)");
+        }
     } else if (buttonPressed && buttonWasPressed) {
         unsigned long holdTime = millis() - buttonPressStart;
         if (holdTime > BOOTSEL_HOLD_TIME_MS && !*pairingMode) {
+            if (!isPaired) {
+                Serial.println("[PAIR] BOOTSEL hold detected, entering pairing mode");
+            }
             enterPairingMode(pairingMode, pairingModeStartTime);
         }
     } else if (!buttonPressed && buttonWasPressed) {
         buttonWasPressed = false;
+        if (!isPaired) {
+            Serial.println("[PAIR] BOOTSEL released");
+        }
     }
 }
 
@@ -219,6 +236,20 @@ bool Pairing::handlePairingPacket(const uint8_t* payload, size_t payloadLen,
         memcpy(pairedTxDeviceId, txId, DEVICE_ID_SIZE);
         *hasPairedTxId = true;
         Serial.println("[RX] Pairing key and TX device ID saved");
+
+        // Debug: print a short fingerprint of the pairing key so TX/RX can be compared
+        // without printing the raw key. (Truncated HMAC over a constant label.)
+        if (security->hasPairingKey()) {
+            const uint8_t label[] = {'F','P','V','K','E','Y'};
+            uint8_t fp[HMAC_SIZE];
+            security->calculateHMAC(label, sizeof(label), fp);
+            Serial.print("[RX] Pairing key fingerprint: ");
+            for (int i = 0; i < HMAC_SIZE; i++) {
+                if (fp[i] < 0x10) Serial.print("0");
+                Serial.print(fp[i], HEX);
+            }
+            Serial.println();
+        }
         
         // Send pairing ACK with RX device ID
         uint8_t ackPacket[1 + DEVICE_ID_SIZE];
@@ -267,6 +298,19 @@ bool Pairing::handlePairingAck(const uint8_t* payload, size_t payloadLen,
             Serial.print(rxId[i], HEX);
         }
         Serial.println();
+
+        // Debug: print a short fingerprint of the pairing key so TX/RX can be compared.
+        if (security->hasPairingKey()) {
+            const uint8_t label[] = {'F','P','V','K','E','Y'};
+            uint8_t fp[HMAC_SIZE];
+            security->calculateHMAC(label, sizeof(label), fp);
+            Serial.print("[TX] Pairing key fingerprint: ");
+            for (int i = 0; i < HMAC_SIZE; i++) {
+                if (fp[i] < 0x10) Serial.print("0");
+                Serial.print(fp[i], HEX);
+            }
+            Serial.println();
+        }
         return true;
     }
     

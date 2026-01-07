@@ -16,22 +16,37 @@ bool Security::begin() {
     // Initialize EEPROM if not already done
     // Use a larger size to accommodate WiFi config + pairing key + device IDs
     EEPROM.begin(256);  // Ensure EEPROM is initialized
-    
-    // Load or generate device ID
-    uint8_t deviceId[DEVICE_ID_SIZE];
-    bool hasDeviceId = false;
-    
-    // Check if device ID exists (look for non-zero bytes)
-    for (int i = 0; i < DEVICE_ID_SIZE; i++) {
-        deviceId[i] = EEPROM.read(DEVICE_ID_ADDR + i);
-        if (deviceId[i] != 0) hasDeviceId = true;
+
+    // Check magic; if mismatched, wipe stored state and re-init
+    uint32_t magic = 0;
+    magic |= (uint32_t)EEPROM.read(SECURITY_MAGIC_ADDR + 0) << 24;
+    magic |= (uint32_t)EEPROM.read(SECURITY_MAGIC_ADDR + 1) << 16;
+    magic |= (uint32_t)EEPROM.read(SECURITY_MAGIC_ADDR + 2) << 8;
+    magic |= (uint32_t)EEPROM.read(SECURITY_MAGIC_ADDR + 3);
+
+    bool magic_ok = (magic == SECURITY_MAGIC_VALUE);
+
+    if (!magic_ok) {
+        // Wipe pairing key, paired device ID, binding UID
+        for (int i = 0; i < PAIRING_KEY_SIZE; i++) EEPROM.write(PAIRING_KEY_ADDR + i, 0);
+        for (int i = 0; i < DEVICE_ID_SIZE; i++) EEPROM.write(PAIRED_DEVICE_ID_ADDR + i, 0);
+        for (int i = 0; i < BINDING_UID_SIZE; i++) EEPROM.write(BINDING_UID_ADDR + i, 0);
+
+        // Generate fresh pairing key and binding UID
+        generatePairingKey();
+        generateBindingUID(DEFAULT_BINDING_PHRASE);
+
+        // Write magic
+        EEPROM.write(SECURITY_MAGIC_ADDR + 0, (SECURITY_MAGIC_VALUE >> 24) & 0xFF);
+        EEPROM.write(SECURITY_MAGIC_ADDR + 1, (SECURITY_MAGIC_VALUE >> 16) & 0xFF);
+        EEPROM.write(SECURITY_MAGIC_ADDR + 2, (SECURITY_MAGIC_VALUE >> 8) & 0xFF);
+        EEPROM.write(SECURITY_MAGIC_ADDR + 3, (SECURITY_MAGIC_VALUE) & 0xFF);
+        EEPROM.commit();
     }
-    
-    if (hasDeviceId) {
-        memcpy(_deviceId, deviceId, DEVICE_ID_SIZE);
-        _deviceIdLoaded = true;
-    } else {
-        // Generate device ID on first boot
+
+    // Load device ID from silicon (RP2040 flash UID) or fallback
+    if (!loadDeviceIdFromSilicon()) {
+        // As a fallback (non-RP2040 targets), generate a random ID
         if (!generateDeviceId()) {
             return false;
         }
@@ -243,7 +258,7 @@ void Security::hmac_sha256(const uint8_t* key, size_t keyLen, const uint8_t* dat
 
 // Device ID management
 bool Security::generateDeviceId() {
-    // Generate random device ID using analog noise + millis + device-specific data
+    // Fallback random device ID (used only if silicon UID is unavailable)
     randomSeed(analogRead(A0) + millis() + (uint32_t)micros());
     for (int i = 0; i < DEVICE_ID_SIZE; i++) {
         _deviceId[i] = random(256);
@@ -261,12 +276,6 @@ bool Security::generateDeviceId() {
         _deviceId[0] = 1;  // Ensure at least one non-zero byte
     }
     
-    // Save to EEPROM
-    for (int i = 0; i < DEVICE_ID_SIZE; i++) {
-        EEPROM.write(DEVICE_ID_ADDR + i, _deviceId[i]);
-    }
-    EEPROM.commit();
-    
     _deviceIdLoaded = true;
     return true;
 }
@@ -275,6 +284,18 @@ bool Security::getDeviceId(uint8_t* deviceId) {
     if (!deviceId || !_deviceIdLoaded) return false;
     memcpy(deviceId, _deviceId, DEVICE_ID_SIZE);
     return true;
+}
+
+bool Security::loadDeviceIdFromSilicon() {
+#if defined(ARDUINO_ARCH_RP2040)
+    uint8_t rawUid[8] = {0};
+    flash_get_unique_id(rawUid);  // 64-bit factory UID
+    memcpy(_deviceId, rawUid, DEVICE_ID_SIZE);
+    _deviceIdLoaded = true;
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool Security::setPairedDeviceId(const uint8_t* deviceId) {

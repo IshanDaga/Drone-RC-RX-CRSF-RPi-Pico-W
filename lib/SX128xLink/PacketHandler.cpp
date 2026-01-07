@@ -86,7 +86,7 @@ void PacketHandler::handleRadioRxTx(SX128xLink* radio, Security* security,
             }
             // Note: Battery telemetry doesn't include device ID in current format
             // For now, accept it if we're paired (could add device ID to battery packet later)
-            if (payload_len == 5) {
+            if (payload_len >= 5) {
                 uint16_t voltage_x10 = (payload[0] << 8) | payload[1];
                 uint16_t current_x10 = (payload[2] << 8) | payload[3];
                 float rx_battery_voltage = voltage_x10 / 10.0f;
@@ -191,12 +191,13 @@ bool PacketHandler::handleRadioRxRx(SX128xLink* radio, Security* security,
     size_t payload_len = pkt.length - 1;
     
     if (type == MSG_CHANNELS) {
-        // Only accept channel data if paired and connected
-        if (!hasPairedTxId || connectionState != STATE_CONNECTED) {
+        // Accept channel data once paired. We allow CONNECTING as well so control
+        // traffic doesn't stall if the sync handshake is jittery.
+        if (!hasPairedTxId || (connectionState != STATE_CONNECTED && connectionState != STATE_CONNECTING)) {
             return false;
         }
         
-        if (payload_len != FRAME_SIZE) {
+        if (payload_len < FRAME_SIZE) {
             return false;
         }
         
@@ -270,6 +271,52 @@ bool PacketHandler::handleSyncPacket(const uint8_t* packet, size_t len,
                 Serial.println("[SYNC] Device ID mismatch in sync packet");
                 lastError = millis();
             }
+        }
+    } else {
+        // Debug: sync parse failures can leave the system stuck in CONNECTING with no visibility.
+        // Rate limit to avoid spamming serial.
+        static unsigned long lastParseFailLog = 0;
+        if (millis() - lastParseFailLog > 2000) {
+            lastParseFailLog = millis();
+
+            Serial.print("[SYNC] parseSyncPacket FAILED len=");
+            Serial.print(len);
+            Serial.print(" keyLoaded=");
+            Serial.print(security && security->hasPairingKey() ? "Y" : "N");
+
+            // If the packet is long enough, print type + HMAC comparison details.
+            const size_t minLen = 1 + DEVICE_ID_SIZE + 2 + 4 + HMAC_SIZE;
+            if (packet && len >= minLen) {
+                const size_t hmacOffset = 1 + DEVICE_ID_SIZE + 2 + 4;
+
+                Serial.print(" type=0x");
+                Serial.print(packet[0], HEX);
+
+                // Print source device ID (first 8 bytes after type)
+                Serial.print(" srcId=");
+                for (int i = 0; i < DEVICE_ID_SIZE; i++) {
+                    if (packet[1 + i] < 0x10) Serial.print("0");
+                    Serial.print(packet[1 + i], HEX);
+                }
+
+                if (security && security->hasPairingKey()) {
+                    uint8_t calc[HMAC_SIZE];
+                    security->calculateHMAC(packet, hmacOffset, calc);
+
+                    Serial.print(" hmacCalc=");
+                    for (int i = 0; i < HMAC_SIZE; i++) {
+                        if (calc[i] < 0x10) Serial.print("0");
+                        Serial.print(calc[i], HEX);
+                    }
+                    Serial.print(" hmacRx=");
+                    for (int i = 0; i < HMAC_SIZE; i++) {
+                        uint8_t b = packet[hmacOffset + i];
+                        if (b < 0x10) Serial.print("0");
+                        Serial.print(b, HEX);
+                    }
+                }
+            }
+            Serial.println();
         }
     }
     

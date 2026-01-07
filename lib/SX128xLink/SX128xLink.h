@@ -79,6 +79,14 @@
 #define SX128X_FLRC_SHAPING RADIOLIB_SHAPING_0_5
 #endif
 
+// Some SX1280 FLRC configurations behave like fixed-length packets (especially after TX).
+// To keep TX/RX interoperable across mixed-length message types, pad all packets to a
+// single fixed length.
+// Set to 0 to disable padding (variable-length).
+#ifndef SX128X_FIXED_PACKET_LEN
+#define SX128X_FIXED_PACKET_LEN 33
+#endif
+
 struct SX128xPacket {
     uint8_t data[64];
     size_t length;

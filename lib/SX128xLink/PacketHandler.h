@@ -9,7 +9,7 @@
 class Security;
 
 // Timing constants
-#define DATA_INTERVAL_MS 20  // 50Hz
+#define DATA_INTERVAL_MS 6  // ~167Hz (higher than 150Hz for safety margin)
 #define SYNC_INTERVAL_MS 1500
 #define BATTERY_TX_INTERVAL_MS 10000
 

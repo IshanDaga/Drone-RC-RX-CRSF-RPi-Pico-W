@@ -8,8 +8,7 @@
 #include <Adafruit_ADS1X15.h>
 #include <math.h>
 
-#include "crsfSerial.h"
-#include "crsf_protocol.h"
+#include "UARTProtocol.h"
 
 // OLED Configuration
 #define SCREEN_WIDTH 128
@@ -21,6 +20,7 @@
 #define ADS1115_ADDRESS 0x48  // Default I2C address (can be 0x48-0x4B)
 
 // Pin definitions
+// I2C - ADC
 #define I2C_SDA 4
 #define I2C_SCL 5
 
@@ -38,15 +38,33 @@
 #define RUDDER_CHANNEL   2  // Stick2 X
 #define THROTTLE_CHANNEL 3  // Stick2 Y
 
-// Menu navigation buttons (active high)
-#define ENTER_BUTTON_PIN 18
-#define BACK_BUTTON_PIN 13
+// Toggle switches (dual-pin reading)
+// Logic: IN1 high = 1000, IN2 high = 2000, both low = 1500
+// T1: GPIO1 (T1IN1), GPIO2 (T1IN2)
+// T2: GPIO3 (T2IN1), GPIO6 (T2IN2)
+// T3: GPIO7 (T3IN1), GPIO10 (T3IN2)
+// T4: GPIO11 (T4IN1), GPIO12 (T4IN2)
+#define TOGGLE_SWITCH1_IN1_PIN 1   // T1IN1
+#define TOGGLE_SWITCH1_IN2_PIN 2   // T1IN2
+#define TOGGLE_SWITCH2_IN1_PIN 3   // T2IN1
+#define TOGGLE_SWITCH2_IN2_PIN 6   // T2IN2
+#define TOGGLE_SWITCH3_IN1_PIN 7   // T3IN1
+#define TOGGLE_SWITCH3_IN2_PIN 10  // T3IN2
+#define TOGGLE_SWITCH4_IN1_PIN 11  // T4IN1
+#define TOGGLE_SWITCH4_IN2_PIN 12  // T4IN2
 
-// Toggle switches (active low)
-#define TOGGLE_SWITCH1_PIN 28
-#define TOGGLE_SWITCH2_PIN 21
-#define TOGGLE_SWITCH3_PIN 3
-#define TOGGLE_SWITCH4_PIN 9
+// Menu navigation buttons (active high)
+#define ENTER_BUTTON_PIN 13  // CN3 [push button 1]
+#define BACK_BUTTON_PIN 14   // CN4 [push button 2]
+
+// SPI Display pins (reserved for future use if needed)
+#define SPI_SCK_PIN 18
+#define SPI_TX_PIN 19
+#define SPI_RX_PIN 20
+#define SPI_CSN_PIN 21
+
+// Buzzer (for boot jingle)
+#define BUZZER_PIN 24
 
 // BQ25620 charger / fuel (ADC) over I2C
 #define BQ25620_I2C_ADDR       0x6A  // Scan showed device at 0x6A
@@ -65,18 +83,39 @@
 #define CAL_MAGIC_VALUE 0xC5
 
 // Timing
-static unsigned long lastCrsfSend = 0;
-static const unsigned long CRSF_INTERVAL = 20;  // 50Hz
+static unsigned long lastChannelSend = 0;
+static const unsigned long CHANNEL_INTERVAL = 4;  // 250Hz (higher than 200Hz for safety margin)
 static unsigned long lastDisplayUpdate = 0;
 static const unsigned long DISPLAY_INTERVAL = 200; // ms
+static unsigned long lastPingSent = 0;
+static const unsigned long PING_INTERVAL = 1000;  // 1Hz ping for device check
+static unsigned long lastPongReceived = 0;
+static const unsigned long PONG_TIMEOUT_MS = 2000;  // TX considered disconnected if no pong for 2s
 
 // Application state
 Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Adafruit_ADS1115 ads;  // ADS1115 ADC on I2C bus
-CrsfSerial crsf(Serial2, CRSF_BAUDRATE);
+UARTProtocol uartProto(&Serial2);
 
-// ADS1115 status flag
+// Telemetry data from TX
+static TelemetryData telemetry = {0};
+static StatusData status = {0};
+static bool telemetryValid = false;
+static bool statusValid = false;
+static unsigned long lastTelemetryUpdate = 0;
+static const unsigned long TELEMETRY_TIMEOUT_MS = 2000;
+
+// Button state for command handling
+static bool enterButtonPressed = false;
+static bool backButtonPressed = false;
+static unsigned long lastEnterPress = 0;
+static unsigned long lastBackPress = 0;
+static const unsigned long BUTTON_DEBOUNCE_MS = 200;
+
+// Device status flags
 bool ads_ok = false;
+bool display_ok = false;
+bool tx_connected = false;  // TX board connection status
 
 // Channel values (mapped to CRSF range 1000-2000)
 uint16_t channels[8] = {1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500};
@@ -113,12 +152,28 @@ static void load_calibration(void);
 static bool init_ads1115(void);
 static void readInputs();
 static void updateDisplay();
-static void sendCrsfChannels();
+static void sendChannels();
+static void receiveUARTMessages();
+static void handleButtons();
 static uint8_t voltage_to_percent(float v);
 static uint8_t percent_to_bars(uint8_t pct);
 static bool bq25620_begin(void);
 static bool bq25620_read_voltage(float &voltage_out, uint16_t &raw_out);
 static void update_tx_battery(void);
+static void play_boot_jingle(void);
+static void scan_i2c_bus(void);
+static bool init_display(void);
+
+// UART Protocol callbacks
+static void onTelemetryReceived(const TelemetryData* data);
+static void onStatusReceived(const StatusData* data);
+static void onAckReceived(UARTMsgType ackedCmd);
+static void onErrorReceived(uint8_t errorCode);
+static void onPongReceived();
+
+// Device check functions
+static bool check_tx_connection(void);
+static void ping_tx_device(void);
 
 // ============================================================
 // Setup
@@ -138,15 +193,24 @@ void setup() {
     Wire.setSDA(I2C_SDA);
     Wire.setSCL(I2C_SCL);
     Wire.begin();
+    
+    // Start with standard I2C speed (100kHz) for compatibility
+    Wire.setClock(100000);  // 100kHz standard mode
+    Serial.println("I2C bus initialized at 100kHz");
+    Serial.print("I2C pins: SDA=GP");
+    Serial.print(I2C_SDA);
+    Serial.print(", SCL=GP");
+    Serial.println(I2C_SCL);
 
-    // Initialize display
-    display.begin(I2C_ADDRESS, true);
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SH110X_WHITE);
-    display.setCursor(0, 0);
-    display.println("RC-CRSF init...");
-    display.display();
+    // Scan I2C bus to see what devices are present
+    scan_i2c_bus();
+
+    // Initialize display with error checking
+    display_ok = init_display();
+    if (!display_ok) {
+        Serial.println("ERROR: Display initialization failed!");
+        Serial.println("Check wiring: SDA=GP4, SCL=GP5, VCC=3.3V, GND=GND");
+    }
 
     // Initialize ADS1115
     ads_ok = init_ads1115();
@@ -161,28 +225,62 @@ void setup() {
     // Initialize buttons and toggles
     pinMode(ENTER_BUTTON_PIN, INPUT_PULLDOWN);
     pinMode(BACK_BUTTON_PIN, INPUT_PULLDOWN);
-    pinMode(TOGGLE_SWITCH1_PIN, INPUT_PULLUP);
-    pinMode(TOGGLE_SWITCH2_PIN, INPUT_PULLUP);
-    pinMode(TOGGLE_SWITCH3_PIN, INPUT_PULLUP);
-    pinMode(TOGGLE_SWITCH4_PIN, INPUT_PULLUP);
+    // Toggle switches - both IN1 and IN2 pins configured as INPUT_PULLUP
+    pinMode(TOGGLE_SWITCH1_IN1_PIN, INPUT_PULLUP);
+    pinMode(TOGGLE_SWITCH1_IN2_PIN, INPUT_PULLUP);
+    pinMode(TOGGLE_SWITCH2_IN1_PIN, INPUT_PULLUP);
+    pinMode(TOGGLE_SWITCH2_IN2_PIN, INPUT_PULLUP);
+    pinMode(TOGGLE_SWITCH3_IN1_PIN, INPUT_PULLUP);
+    pinMode(TOGGLE_SWITCH3_IN2_PIN, INPUT_PULLUP);
+    pinMode(TOGGLE_SWITCH4_IN1_PIN, INPUT_PULLUP);
+    pinMode(TOGGLE_SWITCH4_IN2_PIN, INPUT_PULLUP);
+
+    // Initialize buzzer
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
 
     // Load stick calibration (if present)
     load_calibration();
 
-    // Initialize CRSF serial (outputting to TX side)
-    Serial.println("Initializing CRSF serial...");
+    // Initialize UART protocol (outputting to TX side)
+    Serial.println("Initializing UART protocol...");
     Serial2.setTX(CRSF_TX_PIN);
     Serial2.setRX(CRSF_RX_PIN);
-    crsf.begin(CRSF_BAUDRATE);
-    Serial.print("CRSF on Serial2: TX=GP");
+    uartProto.begin(UART_PROTOCOL_BAUDRATE);
+    uartProto.setOnTelemetry(onTelemetryReceived);
+    uartProto.setOnStatus(onStatusReceived);
+    uartProto.setOnAck(onAckReceived);
+    uartProto.setOnError(onErrorReceived);
+    uartProto.setOnPong(onPongReceived);
+    Serial.print("UART Protocol on Serial2: TX=GP");
     Serial.print(CRSF_TX_PIN);
     Serial.print(", RX=GP");
     Serial.println(CRSF_RX_PIN);
+    
+    // Check TX connection - send initial ping after a short delay
+    Serial.println("Checking TX board connection...");
+    delay(100);  // Give UART time to stabilize
+    lastPingSent = 0;  // Reset to allow immediate ping
+    uartProto.sendPing();  // Send initial ping immediately
+    lastPingSent = millis();
+    Serial.println("[TX] Initial ping sent");
+    check_tx_connection();  // Check initial status
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("RC-CRSF ready");
-    display.display();
+    if (display_ok) {
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("RC-CRSF ready");
+        display.display();
+    }
+
+    // Play boot jingle
+    play_boot_jingle();
+    
+    // Increase I2C speed after initialization if devices are working
+    if (display_ok || ads_ok) {
+        Wire.setClock(400000);  // 400kHz fast mode
+        Serial.println("I2C bus speed increased to 400kHz");
+    }
 }
 
 // ============================================================
@@ -190,7 +288,11 @@ void setup() {
 // ============================================================
 void loop() {
     readInputs();
-    sendCrsfChannels();
+    sendChannels();
+    receiveUARTMessages();
+    ping_tx_device();  // Periodic device check
+    check_tx_connection();  // Update connection status
+    handleButtons();
     update_tx_battery();
     updateDisplay();
 }
@@ -265,60 +367,117 @@ void readInputs() {
     channels[0] = (uint16_t)constrain(channels[0], 1300, 1700);
     channels[1] = (uint16_t)constrain(channels[1], 1300, 1700);
 
-    // Read toggle switches (active low - LOW = switch engaged)
-    bool sw1 = digitalRead(TOGGLE_SWITCH1_PIN) == LOW;
-    bool sw2 = digitalRead(TOGGLE_SWITCH2_PIN) == LOW;
-    bool sw3 = digitalRead(TOGGLE_SWITCH3_PIN) == LOW;
-    bool sw4 = digitalRead(TOGGLE_SWITCH4_PIN) == LOW;
-    raw_toggles[0] = sw1;
-    raw_toggles[1] = sw2;
-    raw_toggles[2] = sw3;
-    raw_toggles[3] = sw4;
-
-    channels[4] = sw1 ? 2000 : 1000;
-    channels[5] = sw2 ? 2000 : 1000;
-    channels[6] = sw3 ? 2000 : 1000;
-    channels[7] = sw4 ? 2000 : 1000;
+    // Read toggle switches (dual-pin reading)
+    // Logic: IN1 high = 1000, IN2 high = 2000, both low = 1500
+    auto readToggle = [](uint8_t in1_pin, uint8_t in2_pin) -> uint16_t {
+        bool in1_high = digitalRead(in1_pin) == HIGH;
+        bool in2_high = digitalRead(in2_pin) == HIGH;
+        
+        if (in1_high && !in2_high) {
+            return 1000;  // IN1 high, IN2 low
+        } else if (!in1_high && in2_high) {
+            return 2000;  // IN1 low, IN2 high
+        } else {
+            return 1500;  // Both low (or both high - treat as center)
+        }
+    };
+    
+    channels[4] = readToggle(TOGGLE_SWITCH1_IN1_PIN, TOGGLE_SWITCH1_IN2_PIN);
+    channels[5] = readToggle(TOGGLE_SWITCH2_IN1_PIN, TOGGLE_SWITCH2_IN2_PIN);
+    channels[6] = readToggle(TOGGLE_SWITCH3_IN1_PIN, TOGGLE_SWITCH3_IN2_PIN);
+    channels[7] = readToggle(TOGGLE_SWITCH4_IN1_PIN, TOGGLE_SWITCH4_IN2_PIN);
+    
+    // Store raw toggle states for logging (using IN1 state as primary indicator)
+    raw_toggles[0] = digitalRead(TOGGLE_SWITCH1_IN1_PIN) == HIGH;
+    raw_toggles[1] = digitalRead(TOGGLE_SWITCH2_IN1_PIN) == HIGH;
+    raw_toggles[2] = digitalRead(TOGGLE_SWITCH3_IN1_PIN) == HIGH;
+    raw_toggles[3] = digitalRead(TOGGLE_SWITCH4_IN1_PIN) == HIGH;
 }
 
 // ============================================================
-// CRSF Output
+// UART Protocol - Channel Output
 // ============================================================
-void sendCrsfChannels() {
-    if (millis() - lastCrsfSend < CRSF_INTERVAL) return;
-    lastCrsfSend = millis();
+void sendChannels() {
+    if (millis() - lastChannelSend < CHANNEL_INTERVAL) return;
+    lastChannelSend = millis();
 
-    // Map channels from 1000-2000 us to CRSF 11-bit values (191-1792)
-    auto mapToCrsf = [](uint16_t us) -> uint16_t {
-        return map(us, 1000, 2000, CRSF_CHANNEL_VALUE_1000, CRSF_CHANNEL_VALUE_2000);
-    };
+    uartProto.sendChannels(channels);
+}
 
-    crsf_channels_t crsfChannels = {0};
-    crsfChannels.ch0 = mapToCrsf(channels[0]);
-    crsfChannels.ch1 = mapToCrsf(channels[1]);
-    crsfChannels.ch2 = mapToCrsf(channels[2]);
-    crsfChannels.ch3 = mapToCrsf(channels[3]);
-    crsfChannels.ch4 = mapToCrsf(channels[4]);
-    crsfChannels.ch5 = mapToCrsf(channels[5]);
-    crsfChannels.ch6 = mapToCrsf(channels[6]);
-    crsfChannels.ch7 = mapToCrsf(channels[7]);
+// ============================================================
+// UART Protocol - Message Reception
+// ============================================================
+void receiveUARTMessages() {
+    uartProto.loop();
+    
+    // Check telemetry timeout
+    if (telemetryValid && (millis() - lastTelemetryUpdate) > TELEMETRY_TIMEOUT_MS) {
+        telemetryValid = false;
+    }
+}
 
-    uint16_t center = CRSF_CHANNEL_VALUE_MID;
-    crsfChannels.ch8 = center;
-    crsfChannels.ch9 = center;
-    crsfChannels.ch10 = center;
-    crsfChannels.ch11 = center;
-    crsfChannels.ch12 = center;
-    crsfChannels.ch13 = center;
-    crsfChannels.ch14 = center;
-    crsfChannels.ch15 = center;
+// ============================================================
+// UART Protocol - Callbacks
+// ============================================================
+void onTelemetryReceived(const TelemetryData* data) {
+    if (data) {
+        memcpy(&telemetry, data, sizeof(TelemetryData));
+        telemetryValid = true;
+        lastTelemetryUpdate = millis();
+    }
+}
 
-    crsf.queuePacket(
-        CRSF_ADDRESS_FLIGHT_CONTROLLER,
-        CRSF_FRAMETYPE_RC_CHANNELS_PACKED,
-        &crsfChannels,
-        CRSF_FRAME_RC_CHANNELS_PAYLOAD_SIZE
-    );
+void onStatusReceived(const StatusData* data) {
+    if (data) {
+        memcpy(&status, data, sizeof(StatusData));
+        statusValid = true;
+    }
+}
+
+void onAckReceived(UARTMsgType ackedCmd) {
+    Serial.print("[UART] ACK received for command: 0x");
+    Serial.println((uint8_t)ackedCmd, HEX);
+}
+
+void onErrorReceived(uint8_t errorCode) {
+    Serial.print("[UART] Error received: 0x");
+    Serial.println(errorCode, HEX);
+}
+
+void onPongReceived() {
+    lastPongReceived = millis();
+    if (!tx_connected) {
+        tx_connected = true;
+        Serial.println("[TX] Device connected!");
+    }
+}
+
+// ============================================================
+// Button Handling for Commands
+// ============================================================
+void handleButtons() {
+    bool enterPressed = digitalRead(ENTER_BUTTON_PIN) == HIGH;
+    bool backPressed = digitalRead(BACK_BUTTON_PIN) == HIGH;
+    
+    // ENTER button - PAIR command
+    if (enterPressed && !enterButtonPressed && (millis() - lastEnterPress) > BUTTON_DEBOUNCE_MS) {
+        enterButtonPressed = true;
+        lastEnterPress = millis();
+        uartProto.sendCommand(UART_MSG_CMD_PAIR);
+        Serial.println("[RC] Sending PAIR command");
+    } else if (!enterPressed) {
+        enterButtonPressed = false;
+    }
+    
+    // BACK button - STATUS_REQ command
+    if (backPressed && !backButtonPressed && (millis() - lastBackPress) > BUTTON_DEBOUNCE_MS) {
+        backButtonPressed = true;
+        lastBackPress = millis();
+        uartProto.sendCommand(UART_MSG_CMD_STATUS_REQ);
+        Serial.println("[RC] Sending STATUS_REQ command");
+    } else if (!backPressed) {
+        backButtonPressed = false;
+    }
 }
 
 // ============================================================
@@ -328,28 +487,118 @@ void updateDisplay() {
     if (millis() - lastDisplayUpdate < DISPLAY_INTERVAL) return;
     lastDisplayUpdate = millis();
 
+    // Only update display if it was successfully initialized
+    if (!display_ok) return;
+
     display.clearDisplay();
     display.setCursor(0, 0);
+    
+    // Line 1: RC-CRSF, TX battery, TX connection, radio status
     display.print("RC-CRSF  ");
     display.print(tx_batt_percent);
-    display.println("%");
+    display.print("%  ");
+    // TX connection status
+    if (tx_connected) {
+        display.print("TX:");
+        if (statusValid) {
+            const char* stateNames[] = {"DISC", "PAIR", "CONN", "OK", "LOST"};
+            if (status.connectionState < 5) {
+                display.print(stateNames[status.connectionState]);
+            }
+        } else {
+            display.print("OK");
+        }
+    } else {
+        display.print("TX:---");
+    }
+    display.println();
 
+    // Line 2: RSSI and SNR
+    if (telemetryValid) {
+        display.print("RSSI:");
+        display.print(telemetry.rssi);
+        display.print(" SNR:");
+        display.print(telemetry.snr, 1);
+    } else {
+        display.print("No telemetry");
+    }
+    display.println();
+
+    // Line 3: Channels 0/1
     display.print("Ch0/1:");
     display.print(channels[0]);
     display.print("/");
     display.println(channels[1]);
-    display.print("Ch2/3:");
-    display.print(channels[2]);
-    display.print("/");
-    display.println(channels[3]);
-
-    display.print("Aux:");
-    display.print(channels[4] > 1500 ? "1" : "0");
-    display.print(channels[5] > 1500 ? "1" : "0");
-    display.print(channels[6] > 1500 ? "1" : "0");
-    display.print(channels[7] > 1500 ? "1" : "0");
+    
+    // Line 4: RX Battery
+    if (telemetryValid) {
+        display.print("RX: ");
+        display.print(telemetry.rxBattMv / 1000.0f, 1);
+        display.print("V ");
+        display.print(telemetry.rxBattPct);
+        display.println("%");
+    } else {
+        display.print("Ch2/3:");
+        display.print(channels[2]);
+        display.print("/");
+        display.println(channels[3]);
+    }
 
     display.display();
+}
+
+// ============================================================
+// TX Device Connection Check
+// ============================================================
+void ping_tx_device(void) {
+    if (millis() - lastPingSent < PING_INTERVAL) return;
+    lastPingSent = millis();
+    
+    static unsigned long lastPingLog = 0;
+    if (millis() - lastPingLog > 5000) {  // Log every 5 seconds to avoid spam
+        Serial.print("[TX] Sending ping (TX connected: ");
+        Serial.print(tx_connected ? "YES" : "NO");
+        Serial.println(")...");
+        lastPingLog = millis();
+    }
+    
+    uartProto.sendPing();
+}
+
+bool check_tx_connection(void) {
+    // Check if we've received a pong recently
+    unsigned long timeSincePong = (lastPongReceived > 0) ? (millis() - lastPongReceived) : PONG_TIMEOUT_MS + 1;
+    
+    bool wasConnected = tx_connected;
+    tx_connected = (timeSincePong < PONG_TIMEOUT_MS);
+    
+    if (wasConnected != tx_connected) {
+        if (tx_connected) {
+            Serial.println("[TX] Device connected");
+        } else {
+            Serial.println("[TX] Device disconnected or not responding");
+            Serial.print("[TX] Last pong received: ");
+            if (lastPongReceived > 0) {
+                Serial.print(timeSincePong);
+                Serial.println("ms ago");
+            } else {
+                Serial.println("never");
+            }
+        }
+    }
+    
+    // Log initial status check
+    static bool initialCheckDone = false;
+    if (!initialCheckDone) {
+        initialCheckDone = true;
+        if (tx_connected) {
+            Serial.println("[TX] Initial check: Device connected");
+        } else {
+            Serial.println("[TX] Initial check: Device not responding (waiting for pong...)");
+        }
+    }
+    
+    return tx_connected;
 }
 
 // ============================================================
@@ -374,6 +623,89 @@ static void load_calibration(void) {
     }
     calib_loaded = true;
     Serial.println("Calibration loaded");
+}
+
+// ==========================================
+// I2C Bus Scanning
+// ==========================================
+static void scan_i2c_bus(void) {
+    Serial.println("Scanning I2C bus...");
+    byte error, address;
+    int nDevices = 0;
+    
+    for (address = 1; address < 127; address++) {
+        Wire.beginTransmission(address);
+        error = Wire.endTransmission();
+        
+        if (error == 0) {
+            Serial.print("I2C device found at address 0x");
+            if (address < 16) Serial.print("0");
+            Serial.print(address, HEX);
+            
+            // Identify common devices
+            if (address == 0x3C || address == 0x3D) {
+                Serial.print(" (OLED/Display - SH1106/SSD1306)");
+            } else if (address >= 0x48 && address <= 0x4B) {
+                Serial.print(" (ADS1115 ADC)");
+            } else if (address == 0x6A) {
+                Serial.print(" (BQ25620 Charger)");
+            }
+            Serial.println(" !");
+            nDevices++;
+        } else if (error == 4) {
+            Serial.print("Unknown error at address 0x");
+            if (address < 16) Serial.print("0");
+            Serial.println(address, HEX);
+        }
+    }
+    
+    if (nDevices == 0) {
+        Serial.println("No I2C devices found!");
+        Serial.println("Check wiring: SDA=GP4, SCL=GP5, VCC=3.3V, GND=GND");
+    } else {
+        Serial.print("Found ");
+        Serial.print(nDevices);
+        Serial.println(" device(s)");
+    }
+}
+
+// ==========================================
+// Display Initialization
+// ==========================================
+static bool init_display(void) {
+    Serial.print("Attempting to initialize display at address 0x");
+    Serial.println(I2C_ADDRESS, HEX);
+    
+    // Wait a bit for display to power up
+    delay(250);
+    
+    // Try default address first
+    if (!display.begin(I2C_ADDRESS, false)) {  // false = no splash screen
+        Serial.println("Failed to initialize display at 0x3C");
+        Serial.println("Trying alternative address 0x3D...");
+        
+        // SH1106 can sometimes be at 0x3D
+        if (!display.begin(0x3D, false)) {
+            Serial.println("Display not found at 0x3C or 0x3D");
+            Serial.println("Check wiring: SDA=GP4, SCL=GP5, VCC=3.3V, GND=GND");
+            return false;
+        } else {
+            Serial.println("Display found at address 0x3D");
+        }
+    } else {
+        Serial.print("Display initialized successfully at address 0x");
+        Serial.println(I2C_ADDRESS, HEX);
+    }
+    
+    // Configure display
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(0, 0);
+    display.println("RC-CRSF init...");
+    display.display();
+    
+    return true;
 }
 
 static bool init_ads1115(void) {
@@ -514,4 +846,18 @@ static void update_tx_battery(void) {
             lastFailLog = millis();
         }
     }
+}
+
+// ==========================================
+// Buzzer - Boot Jingle
+// ==========================================
+static void play_boot_jingle(void) {
+    // buzz the led thrice 
+    for (int i = 0; i < 3; i++) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(500);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(500);
+    }
+    Serial.println("Boot jingle played");
 }

@@ -30,7 +30,8 @@ public:
     static bool getBootselButton();
     
     // RX side: Check if BOOTSEL button is held to enter pairing
-    static void checkBootselButton(bool* pairingMode, unsigned long* pairingModeStartTime);
+    // Logs button press activity when not paired
+    static void checkBootselButton(bool* pairingMode, unsigned long* pairingModeStartTime, bool isPaired);
     
     // RX side: Update pairing mode timeout
     static void updatePairingMode(bool* pairingMode, unsigned long pairingModeStartTime);

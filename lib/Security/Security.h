@@ -3,12 +3,19 @@
 
 #include <Arduino.h>
 #include <stdint.h>
+#if defined(ARDUINO_ARCH_RP2040)
+#include <hardware/flash.h>
+#endif
 
 #define PAIRING_KEY_SIZE 16
 #define HMAC_SIZE 4  // Truncated HMAC-SHA256 (first 4 bytes)
 #define SEQUENCE_SIZE 2
 #define DEVICE_ID_SIZE 8  // 8-byte unique device identifier
 #define BINDING_UID_SIZE 8  // 8-byte UID derived from binding phrase
+
+// EEPROM magic to invalidate old stored state when changed
+#define SECURITY_MAGIC_VALUE 0x54554352UL  // "TECR"
+#define SECURITY_MAGIC_ADDR 120            // 4 bytes
 
 // Compile-time default binding phrase (can be overridden)
 #ifndef DEFAULT_BINDING_PHRASE
@@ -58,6 +65,9 @@ public:
     bool getBindingUID(uint8_t* uid);
     bool hasBindingUID();
     bool verifyBindingUID(const uint8_t* uid);
+
+    // Load device ID from silicon (preferred on RP2040)
+    bool loadDeviceIdFromSilicon();
     
 private:
     uint8_t _pairingKey[PAIRING_KEY_SIZE];

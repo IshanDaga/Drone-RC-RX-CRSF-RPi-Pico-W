@@ -12,9 +12,16 @@
 #include "pairing.h"
 #include "PacketHandler.h"
 
-// CRSF Serial pins
+// CRSF Serial pins (override via build flags if your wiring differs)
+#ifndef CRSF_TX_PIN
 #define CRSF_TX_PIN 8
+#endif
+#ifndef CRSF_RX_PIN
 #define CRSF_RX_PIN 9
+#endif
+
+static_assert(sizeof(crsf_channels_t) == CRSF_FRAME_RC_CHANNELS_PAYLOAD_SIZE,
+              "crsf_channels_t must be 22 bytes (packed CRSF RC channels payload)");
 
 
 // Link timeout
@@ -35,6 +42,7 @@ unsigned long lastDataReceived = 0;
 unsigned long lastSyncReceived = 0;
 uint16_t lastSequence = 0;
 uint16_t syncSequence = 0;
+unsigned long unpairedStartTime = 0;
 
 // Device IDs
 uint8_t rxDeviceId[DEVICE_ID_SIZE];
@@ -62,6 +70,12 @@ unsigned long lastBatteryTxTime = 0;
 // Link statistics telemetry state
 crsfLinkStatistics_t lastLinkStats = {0};
 unsigned long lastLinkStatsLog = 0;
+
+// Auto pairing timeout (seconds), set via build flag; clamped 0..120
+#ifndef AUTO_PAIR_TIMEOUT_SEC
+#define AUTO_PAIR_TIMEOUT_SEC 0
+#endif
+static const unsigned long AUTO_PAIR_TIMEOUT_MS = (AUTO_PAIR_TIMEOUT_SEC > 120 ? 120 : AUTO_PAIR_TIMEOUT_SEC) * 1000UL;
 
 // Forward declarations
 void updateConnectionState();
@@ -119,11 +133,6 @@ void onLinkStats(crsfLinkStatistics_t *ls) {
 // ============================================================
 void setup() {
     Serial.begin(115200);
-    unsigned long start = millis();
-    while (!Serial && (millis() - start < 2000)) {
-        delay(10);
-    }
-    delay(500);
 
     Serial.println("=== FPV Receiver (SX128x) ===");
     Serial.println("Initializing...");
@@ -188,6 +197,7 @@ void setup() {
     } else {
         Serial.println("SX128x init failed");
     }
+    Serial.flush();
 
     // Initialize CRSF
     Serial.println("Initializing CRSF...");
@@ -203,6 +213,7 @@ void setup() {
 
     Serial.println("=== RX Ready ===");
     Serial.println("Hold BOOTSEL for 5 seconds to enter pairing mode");
+    Serial.flush();
 }
 
 // ============================================================
@@ -212,9 +223,32 @@ void loop() {
     // Update connection state machine
     updateConnectionState();
     
-    // Process pairing button
-    Pairing::checkBootselButton(&pairingMode, &pairingModeStartTime);
+    // Process pairing button (log presses when not paired)
+    Pairing::checkBootselButton(&pairingMode, &pairingModeStartTime, hasPairedTxId);
     Pairing::updatePairingMode(&pairingMode, pairingModeStartTime);
+
+    // Auto-enter pairing if not paired within timeout
+    if (!hasPairedTxId && !pairingMode && AUTO_PAIR_TIMEOUT_MS > 0) {
+        if (unpairedStartTime == 0) {
+            unpairedStartTime = millis();
+        }
+        if (millis() - unpairedStartTime > AUTO_PAIR_TIMEOUT_MS) {
+            Serial.println("[PAIR] Auto-entering pairing mode (timeout reached)");
+            Pairing::enterPairingMode(&pairingMode, &pairingModeStartTime);
+            unpairedStartTime = millis();
+        }
+    } else if (hasPairedTxId) {
+        unpairedStartTime = millis();
+    }
+
+    // Periodically log BOOTSEL state when not paired (visibility/debug)
+    static unsigned long lastBootselLog = 0;
+    if (!hasPairedTxId && (millis() - lastBootselLog > 1000)) {
+        bool pressed = Pairing::getBootselButton();
+        Serial.print("[PAIR] BOOTSEL state: ");
+        Serial.println(pressed ? "PRESSED" : "released");
+        lastBootselLog = millis();
+    }
 
     // Handle radio RX
     SX128xPacket pkt;
@@ -228,10 +262,44 @@ void loop() {
         
         switch (type) {
             case MSG_CHANNELS:
-                // Handle channel data
-                PacketHandler::handleRadioRxRx(&radio, &security, pairedTxDeviceId, hasPairedTxId,
-                                                channels, &lastSequence, &lastDataReceived,
-                                                &lastRSSI, &lastSNR, connectionState);
+                // Handle channel data (decode THIS packet's payload).
+                if (hasPairedTxId && (connectionState == STATE_CONNECTED || connectionState == STATE_CONNECTING)) {
+                    if (payload_len >= FRAME_SIZE) {
+                        uint16_t sequence = 0;
+                        if (Protocol::decodeFrame(payload, channels, &sequence, &security, &lastSequence, pairedTxDeviceId)) {
+                            lastDataReceived = millis();
+
+                            static unsigned long lastChanLog = 0;
+                            if (millis() - lastChanLog > 1000) {
+                                Serial.print("[RX] Channels: ");
+                                for (int i = 0; i < 8; i++) {
+                                    Serial.print(channels[i]);
+                                    Serial.print(" ");
+                                }
+                                Serial.print(" Seq: ");
+                                Serial.print(sequence);
+                                Serial.print(" RSSI: ");
+                                Serial.print(lastRSSI);
+                                Serial.print(" SNR: ");
+                                Serial.println(lastSNR);
+                                lastChanLog = millis();
+                            }
+                        } else {
+                            static unsigned long lastBadLog = 0;
+                            if (millis() - lastBadLog > 2000) {
+                                Serial.println("[RX] Invalid channel frame (device ID mismatch / HMAC / decrypt)");
+                                lastBadLog = millis();
+                            }
+                        }
+                    } else {
+                        static unsigned long lastLenLog = 0;
+                        if (millis() - lastLenLog > 2000) {
+                            Serial.print("[RX] MSG_CHANNELS wrong payload len=");
+                            Serial.println(payload_len);
+                            lastLenLog = millis();
+                        }
+                    }
+                }
                 break;
             case MSG_PAIRING:
                 // Handle pairing packet
@@ -242,6 +310,22 @@ void loop() {
                 }
                 break;
             case MSG_SYNC:
+                // Debug visibility: confirm we are actually seeing sync packets and their lengths.
+                {
+                    static unsigned long lastSyncSeenLog = 0;
+                    if (millis() - lastSyncSeenLog > 2000) {
+                        lastSyncSeenLog = millis();
+                        Serial.print("[SYNC] RX saw MSG_SYNC pktLen=");
+                        Serial.print(pkt.length);
+                        Serial.print(" payloadLen=");
+                        Serial.print(payload_len);
+                        if (payload_len > 0) {
+                            Serial.print(" payload0=0x");
+                            Serial.print(payload[0], HEX);
+                        }
+                        Serial.println();
+                    }
+                }
                 // Handle sync packet
                 if (PacketHandler::handleSyncPacket(payload, payload_len, &security,
                                                       pairedTxDeviceId, hasPairedTxId,
@@ -268,9 +352,9 @@ void loop() {
             Serial.println("*** DATA TIMEOUT ***");
             lastTimeout = millis();
         }
-        for (int i = 0; i < 8; i++) {
-            channels[i] = 1500;
-        }
+        // for (int i = 0; i < 8; i++) {
+        //     channels[i] = 1500;
+        // }
     }
 
     // Process CRSF (receives telemetry from FC on GP9)
@@ -312,6 +396,31 @@ void loop() {
             &crsfChannels,
             CRSF_FRAME_RC_CHANNELS_PAYLOAD_SIZE
         );
+
+        // Debug: confirm we're actually writing CRSF frames out the UART.
+        static uint32_t crsfTxCount = 0;
+        static unsigned long lastCrsfLog = 0;
+        crsfTxCount++;
+        if (millis() - lastCrsfLog > 2000) {
+            lastCrsfLog = millis();
+            Serial.print("[CRSF OUT] sent RC frame #");
+            Serial.print(crsfTxCount);
+            Serial.print(" ch0=");
+            Serial.print(channels[0]);
+            Serial.print(" ch1=");
+            Serial.print(channels[1]);
+            Serial.print(" txPin=GP");
+            Serial.print(CRSF_TX_PIN);
+            Serial.print(" rxPin=GP");
+            Serial.println(CRSF_RX_PIN);
+        }
+    }
+
+    // Flush logs periodically to ensure output before potential crash
+    static unsigned long lastFlush = 0;
+    if (millis() - lastFlush > 500) {
+        Serial.flush();
+        lastFlush = millis();
     }
 }
 
@@ -351,8 +460,10 @@ void updateConnectionState() {
             break;
             
         case STATE_CONNECTING:
-            // Wait for sync handshake to complete
-            if (lastSyncReceived > 0 && (millis() - lastSyncReceived < 1000)) {
+            // Consider link "connected" once we see either sync OR valid channel data recently.
+            // This avoids stalling control traffic on sync timing.
+            if ((lastSyncReceived > 0 && (millis() - lastSyncReceived < 1000)) ||
+                (lastDataReceived > 0 && (millis() - lastDataReceived < 1000))) {
                 connectionState = STATE_CONNECTED;
                 connectionStartTime = millis();
                 Serial.println("[STATE] CONNECTING -> CONNECTED");
