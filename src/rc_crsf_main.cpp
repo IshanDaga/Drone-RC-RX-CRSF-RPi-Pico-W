@@ -9,6 +9,7 @@
 #include <math.h>
 
 #include "UARTProtocol.h"
+#include "bq2562x.h"
 
 // OLED Configuration
 #define SCREEN_WIDTH 128
@@ -60,19 +61,15 @@
 // SPI Display pins (reserved for future use if needed)
 #define SPI_SCK_PIN 18
 #define SPI_TX_PIN 19
-#define SPI_RX_PIN 20
 #define SPI_CSN_PIN 21
+
+// Power button (GPIO 20)
+#define POWER_BUTTON_PIN 19
 
 // Buzzer (for boot jingle)
 #define BUZZER_PIN 24
 
-// BQ25620 charger / fuel (ADC) over I2C
-#define BQ25620_I2C_ADDR       0x6A  // Scan showed device at 0x6A
-#define BQ25620_REG_ADC_CONTROL 0x26
-#define BQ25620_REG_ADC_FUNC_DIS0 0x27
-#define BQ25620_REG_VBAT_ADC    0x30
-#define BQ25620_ADC_ENABLE_BIT  0x80
-#define BQ25620_ADC_STEP_V      0.0010f   // Empirically closer for VBAT (was 1.99mV)
+// Battery voltage thresholds
 #define TX_BATT_EMPTY_V         3.2f
 #define TX_BATT_FULL_V          4.2f
 
@@ -108,8 +105,10 @@ static const unsigned long TELEMETRY_TIMEOUT_MS = 2000;
 // Button state for command handling
 static bool enterButtonPressed = false;
 static bool backButtonPressed = false;
+static bool powerButtonPressed = false;
 static unsigned long lastEnterPress = 0;
 static unsigned long lastBackPress = 0;
+static unsigned long lastPowerPress = 0;
 static const unsigned long BUTTON_DEBOUNCE_MS = 200;
 
 // Device status flags
@@ -138,7 +137,7 @@ static calib_data_t calib = {
 };
 static bool calib_loaded = false;
 
-// TX local battery (BQ25620)
+// TX local battery (BQ2562X)
 static float tx_batt_voltage = 0.0f;
 static uint8_t tx_batt_percent = 0;
 static uint8_t tx_batt_bars = 0;
@@ -146,6 +145,10 @@ static bool tx_batt_valid = false;
 static unsigned long last_tx_batt_read = 0;
 static const unsigned long TX_BATT_READ_INTERVAL = 5000; // ms
 static uint16_t tx_batt_raw_last = 0;
+// Charging status
+static enum bq2562x_charge_status tx_charge_status = BQ2562X_CHG_STAT_NOT_CHARGING;
+static enum bq2562x_vbus_status tx_vbus_status = BQ2562X_VBUS_STAT_NO_INPUT;
+static bool tx_charge_status_valid = false;
 
 // Forward declarations
 static void load_calibration(void);
@@ -157,9 +160,9 @@ static void receiveUARTMessages();
 static void handleButtons();
 static uint8_t voltage_to_percent(float v);
 static uint8_t percent_to_bars(uint8_t pct);
-static bool bq25620_begin(void);
-static bool bq25620_read_voltage(float &voltage_out, uint16_t &raw_out);
 static void update_tx_battery(void);
+static const char* get_charge_status_string(enum bq2562x_charge_status status);
+static const char* get_vbus_status_string(enum bq2562x_vbus_status status);
 static void play_boot_jingle(void);
 static void scan_i2c_bus(void);
 static bool init_display(void);
@@ -215,16 +218,22 @@ void setup() {
     // Initialize ADS1115
     ads_ok = init_ads1115();
 
-    // Initialize BQ25620 ADC for TX battery monitoring
-    if (bq25620_begin()) {
-        Serial.println("BQ25620 ADC enabled");
+    // Initialize BQ2562X driver
+    if (bq2562x_init() == 0) {
+        Serial.println("BQ2562X driver initialized");
     } else {
-        Serial.println("BQ25620 init failed");
+        Serial.println("BQ2562X driver init failed");
     }
 
     // Initialize buttons and toggles
     pinMode(ENTER_BUTTON_PIN, INPUT_PULLDOWN);
     pinMode(BACK_BUTTON_PIN, INPUT_PULLDOWN);
+    pinMode(POWER_BUTTON_PIN, INPUT_PULLUP);  // Active LOW button, defaults HIGH
+    Serial.print("[RC] Power button initialized on GPIO ");
+    Serial.print(POWER_BUTTON_PIN);
+    Serial.print(" (INPUT_PULLUP, active LOW)");
+    Serial.print(" - Current state: ");
+    Serial.println(digitalRead(POWER_BUTTON_PIN) == HIGH ? "HIGH (not pressed)" : "LOW (pressed)");
     // Toggle switches - both IN1 and IN2 pins configured as INPUT_PULLUP
     pinMode(TOGGLE_SWITCH1_IN1_PIN, INPUT_PULLUP);
     pinMode(TOGGLE_SWITCH1_IN2_PIN, INPUT_PULLUP);
@@ -361,11 +370,11 @@ void readInputs() {
     };
     const float RATE = 0.7f;
     const float EXPO = 0.3f;
-    channels[0] = applyCurve(channels[0], RATE, EXPO);
-    channels[1] = applyCurve(channels[1], RATE, EXPO);
-    channels[3] = applyCurve(channels[3], RATE, EXPO);
-    channels[0] = (uint16_t)constrain(channels[0], 1300, 1700);
-    channels[1] = (uint16_t)constrain(channels[1], 1300, 1700);
+    // channels[0] = applyCurve(channels[0], RATE, EXPO);
+    // channels[1] = applyCurve(channels[1], RATE, EXPO);
+    // channels[3] = applyCurve(channels[3], RATE, EXPO);
+    // channels[0] = (uint16_t)constrain(channels[0], 1300, 1700);
+    // channels[1] = (uint16_t)constrain(channels[1], 1300, 1700);
 
     // Read toggle switches (dual-pin reading)
     // Logic: IN1 high = 1000, IN2 high = 2000, both low = 1500
@@ -458,6 +467,7 @@ void onPongReceived() {
 void handleButtons() {
     bool enterPressed = digitalRead(ENTER_BUTTON_PIN) == HIGH;
     bool backPressed = digitalRead(BACK_BUTTON_PIN) == HIGH;
+    bool powerPressed = digitalRead(POWER_BUTTON_PIN) == LOW;  // Active LOW button
     
     // ENTER button - PAIR command
     if (enterPressed && !enterButtonPressed && (millis() - lastEnterPress) > BUTTON_DEBOUNCE_MS) {
@@ -478,6 +488,43 @@ void handleButtons() {
     } else if (!backPressed) {
         backButtonPressed = false;
     }
+    
+    // POWER button - Shutdown mode (active LOW)
+    // Debug: log button state changes
+    static bool lastPowerState = false;
+    static unsigned long lastPowerDebugLog = 0;
+    if (powerPressed != lastPowerState) {
+        Serial.print("[RC] Power button state changed: ");
+        Serial.print(lastPowerState ? "PRESSED (LOW)" : "RELEASED (HIGH)");
+        Serial.print(" -> ");
+        Serial.println(powerPressed ? "PRESSED (LOW)" : "RELEASED (HIGH)");
+        lastPowerState = powerPressed;
+    }
+    // Periodic debug log every 5 seconds
+    if (millis() - lastPowerDebugLog > 5000) {
+        Serial.print("[RC] Power button (GPIO ");
+        Serial.print(POWER_BUTTON_PIN);
+        Serial.print(") state: ");
+        Serial.println(powerPressed ? "PRESSED (LOW)" : "RELEASED (HIGH)");
+        lastPowerDebugLog = millis();
+    }
+    
+    if (powerPressed && !powerButtonPressed && (millis() - lastPowerPress) > BUTTON_DEBOUNCE_MS) {
+        powerButtonPressed = true;
+        lastPowerPress = millis();
+        Serial.println("[RC] Power button pressed - entering shutdown mode");
+        int ret = bq2562x_enter_shutdown_mode();
+        if (ret == 0) {
+            Serial.println("[RC] Shutdown mode command sent successfully");
+        } else if (ret == -3) {
+            Serial.println("[RC] Cannot shutdown: VBUS source is present");
+        } else {
+            Serial.print("[RC] Failed to enter shutdown mode: ");
+            Serial.println(ret);
+        }
+    } else if (!powerPressed) {
+        powerButtonPressed = false;
+    }
 }
 
 // ============================================================
@@ -493,11 +540,29 @@ void updateDisplay() {
     display.clearDisplay();
     display.setCursor(0, 0);
     
-    // Line 1: RC-CRSF, TX battery, TX connection, radio status
-    display.print("RC-CRSF  ");
-    display.print(tx_batt_percent);
-    display.print("%  ");
-    // TX connection status
+    // Line 1: RC-CRSF, TX battery voltage & percent
+    display.print("RC-CRSF ");
+    if (tx_batt_valid) {
+        display.print(tx_batt_voltage, 2);
+        display.print("V ");
+        display.print(tx_batt_percent);
+        display.print("%");
+    } else {
+        display.print("---V --%");
+    }
+    display.println();
+    
+    // Line 2: Charging status and VBUS status
+    if (tx_charge_status_valid) {
+        display.print(get_charge_status_string(tx_charge_status));
+        display.print(" ");
+        display.print(get_vbus_status_string(tx_vbus_status));
+    } else {
+        display.print("Status:---");
+    }
+    display.println();
+    
+    // Line 3: TX connection and RSSI/SNR
     if (tx_connected) {
         display.print("TX:");
         if (statusValid) {
@@ -511,38 +576,28 @@ void updateDisplay() {
     } else {
         display.print("TX:---");
     }
-    display.println();
-
-    // Line 2: RSSI and SNR
+    display.print(" ");
     if (telemetryValid) {
         display.print("RSSI:");
         display.print(telemetry.rssi);
-        display.print(" SNR:");
-        display.print(telemetry.snr, 1);
-    } else {
-        display.print("No telemetry");
     }
     display.println();
 
-    // Line 3: Channels 0/1
-    display.print("Ch0/1:");
-    display.print(channels[0]);
-    display.print("/");
-    display.println(channels[1]);
-    
-    // Line 4: RX Battery
+    // Line 4: RX Battery or Channels
     if (telemetryValid) {
-        display.print("RX: ");
+        display.print("RX:");
         display.print(telemetry.rxBattMv / 1000.0f, 1);
         display.print("V ");
         display.print(telemetry.rxBattPct);
-        display.println("%");
+        display.print("% SNR:");
+        display.print(telemetry.snr, 1);
     } else {
-        display.print("Ch2/3:");
-        display.print(channels[2]);
+        display.print("Ch0/1:");
+        display.print(channels[0]);
         display.print("/");
-        display.println(channels[3]);
+        display.print(channels[1]);
     }
+    display.println();
 
     display.display();
 }
@@ -769,82 +824,108 @@ static uint8_t percent_to_bars(uint8_t pct) {
 }
 
 // ==========================================
-// BQ25620 Helpers (TX battery)
+// BQ2562X Battery & Charging Status (TX battery)
 // ==========================================
-static bool bq25620_read8(uint8_t reg, uint8_t &val) {
-    Wire.beginTransmission(BQ25620_I2C_ADDR);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom(BQ25620_I2C_ADDR, (uint8_t)1) != 1) return false;
-    val = Wire.read();
-    return true;
+static const char* get_charge_status_string(enum bq2562x_charge_status status) {
+    switch (status) {
+        case BQ2562X_CHG_STAT_NOT_CHARGING:
+            return "NChg";
+        case BQ2562X_CHG_STAT_CC_MODE:
+            return "CC";
+        case BQ2562X_CHG_STAT_CV_MODE:
+            return "CV";
+        case BQ2562X_CHG_STAT_TOPOFF_ACTIVE:
+            return "Top";
+        default:
+            return "---";
+    }
 }
 
-static bool bq25620_write8(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(BQ25620_I2C_ADDR);
-    Wire.write(reg);
-    Wire.write(val);
-    return Wire.endTransmission() == 0;
-}
-
-static bool bq25620_begin(void) {
-    uint8_t adc_ctrl = 0;
-    if (!bq25620_read8(BQ25620_REG_ADC_CONTROL, adc_ctrl)) {
-        return false;
+static const char* get_vbus_status_string(enum bq2562x_vbus_status status) {
+    switch (status) {
+        case BQ2562X_VBUS_STAT_NO_INPUT:
+            return "NoVBUS";
+        case BQ2562X_VBUS_STAT_USB_SDP:
+            return "SDP";
+        case BQ2562X_VBUS_STAT_USB_CDP:
+            return "CDP";
+        case BQ2562X_VBUS_STAT_USB_DCP:
+            return "DCP";
+        case BQ2562X_VBUS_STAT_UNKNOWN_ADAPTER:
+            return "Unk";
+        case BQ2562X_VBUS_STAT_NON_STANDARD_ADAPTER:
+            return "NonStd";
+        case BQ2562X_VBUS_STAT_HVDCP:
+            return "HVDCP";
+        case BQ2562X_VBUS_STAT_OTG_MODE:
+            return "OTG";
+        default:
+            return "---";
     }
-    // Enable ADC_EN (bit7)
-    adc_ctrl |= BQ25620_ADC_ENABLE_BIT;
-    if (!bq25620_write8(BQ25620_REG_ADC_CONTROL, adc_ctrl)) {
-        return false;
-    }
-    // Touch function-disable register to confirm comms (keep default)
-    uint8_t dummy;
-    bq25620_read8(BQ25620_REG_ADC_FUNC_DIS0, dummy);
-    return true;
-}
-
-static bool bq25620_read_voltage(float &voltage_out, uint16_t &raw_out) {
-    // VBAT ADC is 12-bit in 2 bytes, MSB first
-    Wire.beginTransmission(BQ25620_I2C_ADDR);
-    Wire.write(BQ25620_REG_VBAT_ADC);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom(BQ25620_I2C_ADDR, (uint8_t)2) != 2) return false;
-    uint8_t msb = Wire.read();
-    uint8_t lsb = Wire.read();
-    uint16_t raw = ((uint16_t)msb << 4) | (lsb >> 4);
-    if (raw == 0 || raw == 0x0FFF) {
-        return false;
-    }
-    raw_out = raw;
-    voltage_out = raw * BQ25620_ADC_STEP_V; // volts
-    return true;
 }
 
 static void update_tx_battery(void) {
     if (millis() - last_tx_batt_read < TX_BATT_READ_INTERVAL) return;
     last_tx_batt_read = millis();
 
-    float v = 0.0f;
-    uint16_t raw = 0;
-    if (bq25620_read_voltage(v, raw)) {
-        tx_batt_voltage = v;
+    // Read battery voltage using one-shot ADC conversion
+    uint16_t voltage_mv = 0;
+    int ret = bq2562x_get_battery_voltage_oneshot(&voltage_mv);
+    
+    if (ret == 0 && voltage_mv > 0) {
+        tx_batt_voltage = voltage_mv / 1000.0f;  // Convert mV to volts
         tx_batt_percent = voltage_to_percent(tx_batt_voltage);
         tx_batt_bars = percent_to_bars(tx_batt_percent);
         tx_batt_valid = true;
-        tx_batt_raw_last = raw;
-        Serial.print("[BQ25620] raw:");
-        Serial.print(raw);
-        Serial.print(" V:");
+        tx_batt_raw_last = voltage_mv;
+        
+        Serial.print("[BQ2562X] Voltage: ");
         Serial.print(tx_batt_voltage, 3);
-        Serial.print(" Pct:");
+        Serial.print("V (");
+        Serial.print(voltage_mv);
+        Serial.print("mV) Percent: ");
         Serial.print(tx_batt_percent);
         Serial.println("%");
     } else {
+        tx_batt_valid = false;
         static unsigned long lastFailLog = 0;
         if (millis() - lastFailLog > 10000) {
-            Serial.println("BQ25620 read failed");
+            Serial.print("[BQ2562X] Voltage read failed: ");
+            Serial.println(ret);
             lastFailLog = millis();
         }
+    }
+    
+    // Read charging status
+    enum bq2562x_charge_status chg_stat;
+    ret = bq2562x_get_charge_status(&chg_stat);
+    if (ret == 0) {
+        tx_charge_status = chg_stat;
+        tx_charge_status_valid = true;
+    } else {
+        tx_charge_status_valid = false;
+        chg_stat = tx_charge_status;  // Use last known status for comparison
+    }
+    
+    // Read VBUS status
+    enum bq2562x_vbus_status vbus_stat;
+    ret = bq2562x_get_vbus_status(&vbus_stat);
+    if (ret == 0) {
+        tx_vbus_status = vbus_stat;
+    } else {
+        vbus_stat = tx_vbus_status;  // Use last known status for comparison
+    }
+    
+    // Log status changes
+    static enum bq2562x_charge_status last_chg_stat = BQ2562X_CHG_STAT_NOT_CHARGING;
+    static enum bq2562x_vbus_status last_vbus_stat = BQ2562X_VBUS_STAT_NO_INPUT;
+    if (chg_stat != last_chg_stat || vbus_stat != last_vbus_stat) {
+        Serial.print("[BQ2562X] Status: ");
+        Serial.print(get_charge_status_string(chg_stat));
+        Serial.print(" VBUS: ");
+        Serial.println(get_vbus_status_string(vbus_stat));
+        last_chg_stat = chg_stat;
+        last_vbus_stat = vbus_stat;
     }
 }
 

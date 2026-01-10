@@ -1018,9 +1018,6 @@ void readInputs() {
     channels[0] = applyCurve(channels[0], RATE, EXPO);
     channels[1] = applyCurve(channels[1], RATE, EXPO);
     channels[3] = applyCurve(channels[3], RATE, EXPO);
-    // Limit CH0/CH1 travel to 1300-1700 with center 1500
-    channels[0] = (uint16_t)constrain(channels[0], 1300, 1700);
-    channels[1] = (uint16_t)constrain(channels[1], 1300, 1700);
     
     if (menu_state == MENU_NORMAL_OPERATION) {
         
